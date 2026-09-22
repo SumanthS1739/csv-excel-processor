@@ -1,3 +1,4 @@
+```yaml
 name: Quality Gate
 
 on:
@@ -18,20 +19,28 @@ jobs:
           - 9000:9000
         env:
           SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
-          SONAR_WEB_JAVAOPTS: -Xmx512m
-          SONAR_CE_JAVAOPTS: -Xmx512m
-          SONAR_SEARCH_JAVAOPTS: -Xmx512m
+          SONAR_WEB_JAVAOPTS: "-Xmx512m"
+          SONAR_CE_JAVAOPTS: "-Xmx512m"
+          SONAR_SEARCH_JAVAOPTS: "-Xmx512m"
 
     env:
       SONAR_HOST_URL: http://localhost:9000
       SONAR_ADMIN_PASSWORD: TrainingAdmin123
+      SONAR_PROJECT_KEY: csv-excel-processor
 
     steps:
+
+      # ----------------------------------------------------------
+      # Checkout
+      # ----------------------------------------------------------
       - name: Check out
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # ----------------------------------------------------------
+      # Java
+      # ----------------------------------------------------------
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -39,164 +48,330 @@ jobs:
           java-version: "17"
           cache: maven
 
+      # ----------------------------------------------------------
+      # Wait for SonarQube
+      # ----------------------------------------------------------
       - name: Wait for SonarQube
         run: |
-          echo "Waiting for SonarQube at ${SONAR_HOST_URL}..."
+          echo "Waiting for SonarQube..."
+
           for i in $(seq 1 90); do
-            status=$(curl -sf "${SONAR_HOST_URL}/api/system/status" | jq -r '.status // empty' || true)
-            echo "attempt=${i} status=${status:-DOWN}"
-            if [ "${status}" = "UP" ]; then
-              exit 0
+            STATUS=$(curl -sf \
+              "${SONAR_HOST_URL}/api/system/status" \
+              | jq -r '.status // empty' || true)
+
+            echo "Attempt ${i}: ${STATUS:-DOWN}"
+
+            if [ "${STATUS}" = "UP" ]; then
+              echo "SonarQube is UP"
+              break
             fi
+
             sleep 5
           done
-          echo "SonarQube did not become ready in time"
-          exit 1
 
-      - name: Bootstrap SonarQube auth and failing quality gate
+          if [ "${STATUS:-DOWN}" != "UP" ]; then
+            echo "SonarQube failed to start"
+            exit 1
+          fi
+
+      # ----------------------------------------------------------
+      # Configure SonarQube
+      # ----------------------------------------------------------
+      - name: Configure SonarQube
+        shell: bash
         run: |
           set -euo pipefail
 
-          auth_ok() {
-            curl -sf -u "$1" "${SONAR_HOST_URL}/api/authentication/validate" \
-              | jq -e '.valid == true' >/dev/null
-          }
+          echo "Configuring SonarQube..."
 
-          curl -sS -o /tmp/sonar-change-password.json -w "%{http_code}" -u admin:admin -X POST \
+          # Try to change the default admin password.
+          # If it was already changed, continue.
+          curl -sS \
+            -u admin:admin \
+            -X POST \
             "${SONAR_HOST_URL}/api/users/change_password" \
             --data-urlencode "login=admin" \
             --data-urlencode "previousPassword=admin" \
             --data-urlencode "password=${SONAR_ADMIN_PASSWORD}" \
-            >/tmp/sonar-change-password.status || true
+            >/dev/null || true
 
-          echo "change_password http=$(cat /tmp/sonar-change-password.status)"
+          # ------------------------------------------------------
+          # Find working admin password
+          # ------------------------------------------------------
 
-          if auth_ok "admin:${SONAR_ADMIN_PASSWORD}"; then
-            SONAR_PASSWORD="${SONAR_ADMIN_PASSWORD}"
-          elif auth_ok "admin:admin"; then
-            SONAR_PASSWORD="admin"
+          if curl -sf \
+              -u "admin:${SONAR_ADMIN_PASSWORD}" \
+              "${SONAR_HOST_URL}/api/authentication/validate" \
+              | jq -e '.valid == true' >/dev/null; then
+
+            ADMIN_PASSWORD="${SONAR_ADMIN_PASSWORD}"
+
+          elif curl -sf \
+              -u admin:admin \
+              "${SONAR_HOST_URL}/api/authentication/validate" \
+              | jq -e '.valid == true' >/dev/null; then
+
+            ADMIN_PASSWORD="admin"
+
           else
-            echo "Could not authenticate to SonarQube as admin"
+            echo "ERROR: Cannot authenticate to SonarQube"
             exit 1
           fi
 
-          SONAR_AUTH="admin:${SONAR_PASSWORD}"
+          echo "SonarQube authentication successful."
 
-          TOKEN_JSON=$(curl -sf -u "${SONAR_AUTH}" -X POST \
+          # ------------------------------------------------------
+          # Generate temporary token
+          # ------------------------------------------------------
+
+          TOKEN_JSON=$(curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
             "${SONAR_HOST_URL}/api/user_tokens/generate" \
             --data-urlencode "name=github-actions-${GITHUB_RUN_ID}")
 
-          SONAR_LOGIN=$(echo "${TOKEN_JSON}" | jq -r '.token // empty')
+          SONAR_TOKEN=$(echo "${TOKEN_JSON}" | jq -r '.token // empty')
 
-          if [ -z "${SONAR_LOGIN}" ]; then
-            echo "Token generation failed; using admin login/password"
-            SONAR_LOGIN="admin"
-            echo "SONAR_PASSWORD=${SONAR_PASSWORD}" >> "${GITHUB_ENV}"
-          else
-            echo "::add-mask::${SONAR_LOGIN}"
-            SONAR_PASSWORD=""
-            echo "SONAR_PASSWORD=" >> "${GITHUB_ENV}"
+          if [ -z "${SONAR_TOKEN}" ]; then
+            echo "ERROR: Could not generate SonarQube token"
+            exit 1
           fi
 
-          echo "SONAR_LOGIN=${SONAR_LOGIN}" >> "${GITHUB_ENV}"
-          echo "SONAR_AUTH=${SONAR_AUTH}" >> "${GITHUB_ENV}"
+          echo "::add-mask::${SONAR_TOKEN}"
+          echo "SONAR_TOKEN=${SONAR_TOKEN}" >> "${GITHUB_ENV}"
 
-          curl -sf -u "${SONAR_AUTH}" -X POST \
-            "${SONAR_HOST_URL}/api/qualitygates/create" \
-            --data-urlencode "name=workshop-fail" || true
+          echo "SonarQube token generated."
 
-          create_condition() {
-            curl -sf -u "${SONAR_AUTH}" -X POST \
-              "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
-              --data-urlencode "gateName=workshop-fail" \
-              --data-urlencode "metric=${1}" \
-              --data-urlencode "op=${2}" \
-              --data-urlencode "error=${3}" || true
-          }
+          # ------------------------------------------------------
+          # Create quality gate if it doesn't exist
+          # ------------------------------------------------------
 
-          create_condition bugs GT 0
-          create_condition vulnerabilities GT 0
-          create_condition code_smells GT 0
-          create_condition coverage LT 80
+          if curl -sf \
+              -u "admin:${ADMIN_PASSWORD}" \
+              "${SONAR_HOST_URL}/api/qualitygates/show?name=workshop-fail" \
+              >/dev/null; then
 
-          curl -sf -u "${SONAR_AUTH}" -X POST \
+            echo "Quality gate workshop-fail already exists."
+
+          else
+
+            echo "Creating quality gate workshop-fail..."
+
+            curl -sf \
+              -u "admin:${ADMIN_PASSWORD}" \
+              -X POST \
+              "${SONAR_HOST_URL}/api/qualitygates/create" \
+              --data-urlencode "name=workshop-fail"
+
+            echo "Quality gate created."
+
+          fi
+
+          # ------------------------------------------------------
+          # Get gate ID
+          # ------------------------------------------------------
+
+          GATE_JSON=$(curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            "${SONAR_HOST_URL}/api/qualitygates/show?name=workshop-fail")
+
+          GATE_ID=$(echo "${GATE_JSON}" | jq -r '.id // empty')
+
+          if [ -z "${GATE_ID}" ]; then
+            echo "ERROR: Could not get quality gate ID"
+            exit 1
+          fi
+
+          echo "Quality gate ID: ${GATE_ID}"
+
+          # ------------------------------------------------------
+          # Remove existing conditions
+          # ------------------------------------------------------
+
+          CONDITIONS=$(echo "${GATE_JSON}" | jq -r \
+            '.conditions[]?.id // empty')
+
+          for CONDITION_ID in ${CONDITIONS}; do
+            echo "Removing old condition ${CONDITION_ID}"
+
+            curl -sf \
+              -u "admin:${ADMIN_PASSWORD}" \
+              -X POST \
+              "${SONAR_HOST_URL}/api/qualitygates/delete_condition" \
+              --data-urlencode "id=${CONDITION_ID}" \
+              || true
+          done
+
+          # ------------------------------------------------------
+          # Create conditions
+          # ------------------------------------------------------
+
+          echo "Creating quality gate conditions..."
+
+          curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
+            "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+            --data-urlencode "gateName=workshop-fail" \
+            --data-urlencode "metric=bugs" \
+            --data-urlencode "op=GT" \
+            --data-urlencode "error=0"
+
+          curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
+            "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+            --data-urlencode "gateName=workshop-fail" \
+            --data-urlencode "metric=vulnerabilities" \
+            --data-urlencode "op=GT" \
+            --data-urlencode "error=0"
+
+          curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
+            "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+            --data-urlencode "gateName=workshop-fail" \
+            --data-urlencode "metric=code_smells" \
+            --data-urlencode "op=GT" \
+            --data-urlencode "error=0"
+
+          curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
+            "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+            --data-urlencode "gateName=workshop-fail" \
+            --data-urlencode "metric=coverage" \
+            --data-urlencode "op=LT" \
+            --data-urlencode "error=80"
+
+          # ------------------------------------------------------
+          # Set as default
+          # ------------------------------------------------------
+
+          curl -sf \
+            -u "admin:${ADMIN_PASSWORD}" \
+            -X POST \
             "${SONAR_HOST_URL}/api/qualitygates/set_as_default" \
-            --data-urlencode "name=workshop-fail" || true
+            --data-urlencode "name=workshop-fail"
 
+          echo "SonarQube configuration completed."
+
+      # ----------------------------------------------------------
+      # Maven + Sonar analysis
+      # ----------------------------------------------------------
       - name: Run tests, coverage, and Sonar analysis
         id: scan
         continue-on-error: true
+        shell: bash
         run: |
           chmod +x mvnw
 
-          MVN_SONAR_ARGS=(
-            -Dsonar.host.url="${SONAR_HOST_URL}"
-            -Dsonar.login="${SONAR_LOGIN}"
-            -Dsonar.projectKey=csv-excel-processor
-            -Dsonar.projectName="CSV to Excel Processor (Coding Standards Demo)"
-            -Dsonar.qualitygate.wait=true
+          ./mvnw -B verify sonar:sonar \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.login="${SONAR_TOKEN}" \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectName="CSV to Excel Processor" \
+            -Dsonar.qualitygate.wait=true \
             -Dsonar.qualitygate.timeout=300
-          )
 
-          if [ -n "${SONAR_PASSWORD:-}" ]; then
-            MVN_SONAR_ARGS+=(-Dsonar.password="${SONAR_PASSWORD}")
-          fi
-
-          ./mvnw -B verify sonar:sonar "${MVN_SONAR_ARGS[@]}"
-
-      - name: Export SonarQube report
+      # ----------------------------------------------------------
+      # Get quality gate result
+      # ----------------------------------------------------------
+      - name: Check quality gate result
         if: always()
         run: |
-          set -euo pipefail
+          set -e
 
+          echo "Checking final SonarQube quality gate..."
+
+          RESPONSE=$(curl -sf \
+            -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}")
+
+          echo "${RESPONSE}" | jq .
+
+          STATUS=$(echo "${RESPONSE}" | jq -r \
+            '.projectStatus.status // "UNKNOWN"')
+
+          echo "Quality Gate Status: ${STATUS}"
+
+          if [ "${STATUS}" != "OK" ]; then
+            echo "Quality Gate FAILED"
+            exit 1
+          fi
+
+          echo "Quality Gate PASSED"
+
+      # ----------------------------------------------------------
+      # Export report
+      # ----------------------------------------------------------
+      - name: Export SonarQube report
+        if: always()
+        shell: bash
+        run: |
           mkdir -p sonar-report
-          AUTH="${SONAR_AUTH:-admin:${SONAR_ADMIN_PASSWORD}}"
-          PROJECT_KEY=csv-excel-processor
 
-          curl -sf -u "${AUTH}" \
-            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT_KEY}" \
+          curl -sf \
+            -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
             > sonar-report/quality-gate.json
 
-          curl -sf -u "${AUTH}" \
-            "${SONAR_HOST_URL}/api/measures/component?component=${PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots,sqale_index,reliability_rating,security_rating,sqale_rating" \
+          curl -sf \
+            -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/measures/component?component=${SONAR_PROJECT_KEY}&metricKeys=bugs,vulnerabilities,code_smells,coverage,duplicated_lines_density,ncloc,security_hotspots" \
             > sonar-report/measures.json
 
-          curl -sf -u "${AUTH}" \
-            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&ps=500&additionalFields=rules" \
+          curl -sf \
+            -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/issues/search?componentKeys=${SONAR_PROJECT_KEY}&ps=500" \
             > sonar-report/issues.json
 
-          python3 <<'PY'
+          python3 - <<'PY'
           import json
           from pathlib import Path
 
           report = Path("sonar-report")
 
-          qg = json.loads((report / "quality-gate.json").read_text())
-          measures_raw = json.loads((report / "measures.json").read_text())
-          issues_raw = json.loads((report / "issues.json").read_text())
+          qg = json.loads(
+              (report / "quality-gate.json").read_text()
+          )
 
-          status = qg.get("projectStatus", {}).get("status", "UNKNOWN")
-          conditions = qg.get("projectStatus", {}).get("conditions", [])
+          measures_raw = json.loads(
+              (report / "measures.json").read_text()
+          )
+
+          issues_raw = json.loads(
+              (report / "issues.json").read_text()
+          )
+
+          status = qg.get(
+              "projectStatus", {}
+          ).get("status", "UNKNOWN")
+
+          conditions = qg.get(
+              "projectStatus", {}
+          ).get("conditions", [])
 
           measures = {
               m.get("metric"): m.get("value", "")
-              for m in measures_raw.get("component", {}).get("measures", [])
+              for m in measures_raw
+              .get("component", {})
+              .get("measures", [])
           }
 
           issues = issues_raw.get("issues", [])
 
           lines = [
-              "# SonarQube quality gate report",
+              "# SonarQube Quality Gate Report",
               "",
               f"**Project:** csv-excel-processor",
               f"**Status:** {status}",
               "",
-              "Report generated from the GitHub Actions runner.",
-              "",
               "## Measures",
               "",
               "| Metric | Value |",
-              "| --- | --- |",
+              "|---|---|",
           ]
 
           for key in [
@@ -208,19 +383,25 @@ jobs:
               "duplicated_lines_density",
               "ncloc",
           ]:
-              lines.append(f"| {key} | {measures.get(key, 'n/a')} |")
+              lines.append(
+                  f"| {key} | {measures.get(key, 'n/a')} |"
+              )
 
           lines += [
               "",
-              "## Quality gate conditions",
+              "## Quality Gate Conditions",
               "",
-              "| Metric | Operator | Error threshold | Actual | Status |",
-              "| --- | --- | --- | --- | --- |"
+              "| Metric | Operator | Threshold | Actual | Status |",
+              "|---|---|---|---|---|",
           ]
 
-          for c in conditions:
+          for condition in conditions:
               lines.append(
-                  f"| {c.get('metric')} | {c.get('comparator')} | {c.get('errorThreshold')} | {c.get('actualValue')} | {c.get('status')} |"
+                  f"| {condition.get('metric')} "
+                  f"| {condition.get('comparator')} "
+                  f"| {condition.get('errorThreshold')} "
+                  f"| {condition.get('actualValue')} "
+                  f"| {condition.get('status')} |"
               )
 
           lines += [
@@ -228,13 +409,52 @@ jobs:
               f"## Issues ({len(issues)})",
               "",
               "| Severity | Type | File | Line | Message |",
-              "| --- | --- | --- | --- | --- |"
+              "|---|---|---|---|---|",
           ]
 
           for issue in issues:
-              component = issue.get("component", "").split(":", 1)[-1]
-              line = issue.get("line", "")
-              message = str(issue.get("message", "")).replace("|", "\\|").replace("\n", " ")
+              component = issue.get(
+                  "component", ""
+              ).split(":", 1)[-1]
+
+              message = str(
+                  issue.get("message", "")
+              ).replace("|", "\\|").replace("\n", " ")
 
               lines.append(
-                  f"| {issue.get('severity', '')} | {issue
+                  f"| {issue.get('severity', '')} "
+                  f"| {issue.get('type', '')} "
+                  f"| {component} "
+                  f"| {issue.get('line', '')} "
+                  f"| {message} |"
+              )
+
+          (report / "quality-gate-report.md").write_text(
+              "\n".join(lines) + "\n"
+          )
+
+          print("Report generated.")
+
+          PY
+
+      # ----------------------------------------------------------
+      # Upload report
+      # ----------------------------------------------------------
+      - name: Upload SonarQube report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-quality-gate-report
+          path: sonar-report/
+          if-no-files-found: warn
+
+      # ----------------------------------------------------------
+      # Fail workflow if Maven/Sonar itself failed
+      # ----------------------------------------------------------
+      - name: Fail if Sonar analysis failed
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "SonarQube analysis or quality gate failed."
+          echo "Download sonar-quality-gate-report from the workflow artifacts."
+          exit 1
+```
