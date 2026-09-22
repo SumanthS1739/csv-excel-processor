@@ -2,8 +2,11 @@ package com.training.codingstandards;
 
 import java.io.File;
 import java.util.List;
+import java.util.logging.Logger;
 
 public class App {
+
+    private static final Logger LOGGER = Logger.getLogger(App.class.getName());
 
     public static void main(String[] args) {
         String csvPath = null;
@@ -16,7 +19,7 @@ public class App {
             excelPath = args[1];
         }
 
-        System.out.println("CSV to Excel processor starting...");
+        LOGGER.info("CSV to Excel processor starting...");
         CsvEmployeeReader reader = new CsvEmployeeReader();
         List<Employee> employees = reader.read(csvPath);
 
@@ -35,9 +38,9 @@ public class App {
                     .map(employee -> employee.empId)
                     .orElseThrow(() -> new IllegalArgumentException("No employees are available for lookup"));
                 Employee lookedUp = db.findEmployee(employeeId);
-                System.out.println("Lookup result: " + (lookedUp == null ? "not found" : lookedUp.name));
+                LOGGER.info("Lookup result: " + (lookedUp == null ? "not found" : lookedUp.name));
         }
 
-        System.out.println("Processed " + rows.size() + " employees into " + excelPath);
+        LOGGER.info("Processed " + rows.size() + " employees into " + excelPath);
     }
 }

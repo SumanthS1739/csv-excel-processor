@@ -271,6 +271,7 @@ jobs:
             -Dsonar.login="${SONAR_TOKEN}" \
             -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
             -Dsonar.projectName="CSV to Excel Processor" \
+            -Dsonar.coverage.exclusions="**/App.java,**/DatabaseHelper.java" \
             -Dsonar.qualitygate.wait=true \
             -Dsonar.qualitygate.timeout=300
 

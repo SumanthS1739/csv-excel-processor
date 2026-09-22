@@ -3,21 +3,18 @@ package com.training.codingstandards;
 import java.util.Date;
 import java.util.Objects;
 
-/**
- * Employee record loaded from CSV.
- * Intentionally poorly encapsulated for the workshop.
- */
+/** Employee record loaded from CSV. */
 public class Employee {
 
-    public String empId;
-    public String name;
-    public String email;
-    public String department;
-    public double salary;
-    public int yearsOfService;
-    public String country;
-    public String managerEmail;
-    public Date lastProcessed;
+    String empId;
+    String name;
+    String email;
+    String department;
+    double salary;
+    int yearsOfService;
+    String country;
+    String managerEmail;
+    Date lastProcessed;
 
     public Employee() {
     }
