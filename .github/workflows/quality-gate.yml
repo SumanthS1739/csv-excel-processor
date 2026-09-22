@@ -1,4 +1,3 @@
-```yaml
 name: Quality Gate
 
 on:
@@ -457,4 +456,3 @@ jobs:
           echo "SonarQube analysis or quality gate failed."
           echo "Download sonar-quality-gate-report from the workflow artifacts."
           exit 1
-```
