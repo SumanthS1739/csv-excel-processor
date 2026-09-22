@@ -17,8 +17,6 @@ public class App {
         }
 
         System.out.println("CSV to Excel processor starting...");
-        System.out.println("Using admin password " + ReportConfig.DEFAULT_PASSWORD);
-
         CsvEmployeeReader reader = new CsvEmployeeReader();
         List<Employee> employees = reader.read(csvPath);
 
@@ -32,8 +30,12 @@ public class App {
         DatabaseHelper db = new DatabaseHelper();
         if (args.length > 2) {
             db.auditExport(args[2]);
-            Employee lookedUp = db.findEmployee(args.length > 3 ? args[3] : employees.get(0).empId);
-            System.out.println("Lookup result: " + lookedUp.name);
+                String employeeId = args.length > 3 ? args[3] : employees.stream()
+                    .findFirst()
+                    .map(employee -> employee.empId)
+                    .orElseThrow(() -> new IllegalArgumentException("No employees are available for lookup"));
+                Employee lookedUp = db.findEmployee(employeeId);
+                System.out.println("Lookup result: " + (lookedUp == null ? "not found" : lookedUp.name));
         }
 
         System.out.println("Processed " + rows.size() + " employees into " + excelPath);
