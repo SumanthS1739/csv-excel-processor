@@ -2,7 +2,9 @@ name: Quality Gate
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - fix-sonarqube-pipeline
   pull_request:
   workflow_dispatch:
 
