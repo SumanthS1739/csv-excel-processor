@@ -10,6 +10,7 @@ jobs:
   quality-gate:
     name: SonarQube quality gate
     runs-on: ubuntu-latest
+
     services:
       sonarqube:
         image: sonarqube:lts-community
@@ -20,9 +21,11 @@ jobs:
           SONAR_WEB_JAVAOPTS: -Xmx512m
           SONAR_CE_JAVAOPTS: -Xmx512m
           SONAR_SEARCH_JAVAOPTS: -Xmx512m
+
     env:
       SONAR_HOST_URL: http://localhost:9000
       SONAR_ADMIN_PASSWORD: TrainingAdmin123
+
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -59,13 +62,13 @@ jobs:
               | jq -e '.valid == true' >/dev/null
           }
 
-          # First login on Community images requires changing admin/admin.
           curl -sS -o /tmp/sonar-change-password.json -w "%{http_code}" -u admin:admin -X POST \
             "${SONAR_HOST_URL}/api/users/change_password" \
             --data-urlencode "login=admin" \
             --data-urlencode "previousPassword=admin" \
             --data-urlencode "password=${SONAR_ADMIN_PASSWORD}" \
             >/tmp/sonar-change-password.status || true
+
           echo "change_password http=$(cat /tmp/sonar-change-password.status)"
 
           if auth_ok "admin:${SONAR_ADMIN_PASSWORD}"; then
@@ -76,12 +79,15 @@ jobs:
             echo "Could not authenticate to SonarQube as admin"
             exit 1
           fi
+
           SONAR_AUTH="admin:${SONAR_PASSWORD}"
 
           TOKEN_JSON=$(curl -sf -u "${SONAR_AUTH}" -X POST \
             "${SONAR_HOST_URL}/api/user_tokens/generate" \
             --data-urlencode "name=github-actions-${GITHUB_RUN_ID}")
+
           SONAR_LOGIN=$(echo "${TOKEN_JSON}" | jq -r '.token // empty')
+
           if [ -z "${SONAR_LOGIN}" ]; then
             echo "Token generation failed; using admin login/password"
             SONAR_LOGIN="admin"
@@ -107,6 +113,7 @@ jobs:
               --data-urlencode "op=${2}" \
               --data-urlencode "error=${3}" || true
           }
+
           create_condition bugs GT 0
           create_condition vulnerabilities GT 0
           create_condition code_smells GT 0
@@ -121,8 +128,7 @@ jobs:
         continue-on-error: true
         run: |
           chmod +x mvnw
-          # sonar-maven-plugin 4.0.x reads credentials from sonar.login
-          # (a user token, or admin + sonar.password). sonar.token is ignored.
+
           MVN_SONAR_ARGS=(
             -Dsonar.host.url="${SONAR_HOST_URL}"
             -Dsonar.login="${SONAR_LOGIN}"
@@ -131,15 +137,18 @@ jobs:
             -Dsonar.qualitygate.wait=true
             -Dsonar.qualitygate.timeout=300
           )
+
           if [ -n "${SONAR_PASSWORD:-}" ]; then
             MVN_SONAR_ARGS+=(-Dsonar.password="${SONAR_PASSWORD}")
           fi
+
           ./mvnw -B verify sonar:sonar "${MVN_SONAR_ARGS[@]}"
 
       - name: Export SonarQube report
         if: always()
         run: |
           set -euo pipefail
+
           mkdir -p sonar-report
           AUTH="${SONAR_AUTH:-admin:${SONAR_ADMIN_PASSWORD}}"
           PROJECT_KEY=csv-excel-processor
@@ -156,21 +165,24 @@ jobs:
             "${SONAR_HOST_URL}/api/issues/search?componentKeys=${PROJECT_KEY}&ps=500&additionalFields=rules" \
             > sonar-report/issues.json
 
-          python3 - <<'PY'
+          python3 <<'PY'
           import json
           from pathlib import Path
 
           report = Path("sonar-report")
-          qg = json.loads((report / "quality-gate.json").read_text(encoding="utf-8"))
-          measures_raw = json.loads((report / "measures.json").read_text(encoding="utf-8"))
-          issues_raw = json.loads((report / "issues.json").read_text(encoding="utf-8"))
+
+          qg = json.loads((report / "quality-gate.json").read_text())
+          measures_raw = json.loads((report / "measures.json").read_text())
+          issues_raw = json.loads((report / "issues.json").read_text())
 
           status = qg.get("projectStatus", {}).get("status", "UNKNOWN")
           conditions = qg.get("projectStatus", {}).get("conditions", [])
+
           measures = {
               m.get("metric"): m.get("value", "")
               for m in measures_raw.get("component", {}).get("measures", [])
           }
+
           issues = issues_raw.get("issues", [])
 
           lines = [
@@ -179,13 +191,14 @@ jobs:
               f"**Project:** csv-excel-processor",
               f"**Status:** {status}",
               "",
-              "The dashboard URL in the Maven log (`http://localhost:9000/...`) is only reachable on the GitHub Actions runner. Download this artifact instead.",
+              "Report generated from the GitHub Actions runner.",
               "",
               "## Measures",
               "",
               "| Metric | Value |",
               "| --- | --- |",
           ]
+
           for key in [
               "bugs",
               "vulnerabilities",
@@ -197,38 +210,31 @@ jobs:
           ]:
               lines.append(f"| {key} | {measures.get(key, 'n/a')} |")
 
-          lines += ["", "## Quality gate conditions", "", "| Metric | Operator | Error threshold | Actual | Status |", "| --- | --- | --- | --- | --- |"]
+          lines += [
+              "",
+              "## Quality gate conditions",
+              "",
+              "| Metric | Operator | Error threshold | Actual | Status |",
+              "| --- | --- | --- | --- | --- |"
+          ]
+
           for c in conditions:
               lines.append(
                   f"| {c.get('metric')} | {c.get('comparator')} | {c.get('errorThreshold')} | {c.get('actualValue')} | {c.get('status')} |"
               )
 
-          lines += ["", f"## Issues ({len(issues)})", "", "| Severity | Type | File | Line | Message |", "| --- | --- | --- | --- | --- |"]
+          lines += [
+              "",
+              f"## Issues ({len(issues)})",
+              "",
+              "| Severity | Type | File | Line | Message |",
+              "| --- | --- | --- | --- | --- |"
+          ]
+
           for issue in issues:
               component = issue.get("component", "").split(":", 1)[-1]
               line = issue.get("line", "")
               message = str(issue.get("message", "")).replace("|", "\\|").replace("\n", " ")
+
               lines.append(
-                  f"| {issue.get('severity', '')} | {issue.get('type', '')} | {component} | {line} | {message} |"
-              )
-
-          (report / "quality-gate-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
-
-          echo "Report written to sonar-report/"
-
-      - name: Upload SonarQube report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sonar-quality-gate-report
-          path: sonar-report/
-          if-no-files-found: warn
-
-      - name: Fail job because quality gate did not pass
-        if: steps.scan.outcome == 'failure'
-        run: |
-          echo "QUALITY GATE STATUS: FAILED"
-          echo "Download the sonar-quality-gate-report artifact from this workflow run."
-          echo "localhost:9000 is only available on the GitHub Actions runner."
-          exit 1
+                  f"| {issue.get('severity', '')} | {issue
